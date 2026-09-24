@@ -123,6 +123,37 @@ Suggested order: 6 + 8 together, then 7, then 9, then 10.
    for the exact CLI or socket protocol at `~/.config/herdr/herdr.sock`). On any event, re-fetch tabs.
    Keep a slow fallback poll (e.g. 10 s) for tab add/remove/rename/focus if those have no events, and
    to recover if herdr restarts.
+
+   **Plan (researched 2026-09-23, herdr 0.9.1, API protocol 22):**
+   - Protocol: Unix socket `~/.config/herdr/herdr.sock`, newline-delimited JSON. Request
+     `{"id":"1","method":"...","params":{...}}` → `{"id":"1","result":{...}}` (or `"error"`). Full schema:
+     `herdr api schema --json`.
+   - Subscribing: `events.subscribe` with `params.subscriptions: [{"type": "<kind>"}, ...]` → replies
+     `{"result":{"type":"subscription_started"}}`, then streams `{"event": ..., "data": ...}` lines on the
+     same connection. Structural kinds need no args: `workspace.focused/created/closed/renamed`,
+     `tab.created/closed/focused/renamed/moved`, `pane.created/closed/updated/exited/agent_detected`.
+   - Catch: `pane.agent_status_changed` **requires a `pane_id`** (one subscription per pane). Open
+     question: does `pane.updated` (no args; carries `agent_status`) also fire on status changes? A probe
+     logging all events is running — check its log before coding. If yes → subscribe to `pane.updated` only.
+     If no → add one `pane.agent_status_changed` per pane id from the snapshot, and reconnect with a new
+     list whenever the set of pane ids changes.
+   - Data: replace the 2 CLI calls with one socket request, `session.snapshot` (same as
+     `herdr api snapshot`): `workspaces`, `tabs` (same fields as `tab list`), `panes`,
+     `focused_workspace_id`. Tap → socket `tab.focus` too. Result: **no `herdr` processes at all.**
+   - Code shape: `HerdrSocket` (POSIX `socket(AF_UNIX)` + `connect`; `request(method, params)` = connect,
+     write one line, read one line, close). `EventStream` on a background thread: connect, subscribe, read
+     lines; any event → refresh on main, debounced ~100 ms. On EOF/error → treat as maybe-off, refresh,
+     retry the connection every 3 s.
+   - Keep a 10 s fallback timer (belt and braces; covers missed events and focus changes made in herdr
+     if those don't all emit events).
+   - Test: switch tabs/workspaces in herdr, create/close/rename a tab, let an agent go working→done/
+     blocked — bar should update with no visible lag; `ps` shows no `herdr` child processes; CPU ~0.
+   - Risk: the socket API is versioned (`protocol: 22`); a herdr update could change it. On decode
+     failures, log once and fall back to the 1 s CLI poll? — keep it simple unless it happens.
+   **Built 2026-09-24, not yet verified.** Socket client + `EventStream` as planned (subscribes to both
+   `pane.updated` and per-pane `pane.agent_status_changed`, logs them). Tab focus events confirmed working
+   (probe). Open issue: after launch, a working→done change on the CC pane logged **no** status event, so
+   status may only update via the 10 s fallback — investigate before marking done.
 8. **Make "blocked" stand out** — red `bezelColor` on blocked tabs (e.g. `.systemRed`); the accent color
    stays for the focused tab. Decide with the user what a focused *and* blocked tab looks like.
    **Done 2026-09-23.** Blocked tabs get `.systemRed`; red wins on a focused + blocked tab.

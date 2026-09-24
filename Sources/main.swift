@@ -1,5 +1,6 @@
 // HerdrBar — Touch Bar control panel for herdr.
 // One Touch Bar button per herdr tab (focused workspace) with live agent status; tap to jump to the tab.
+// Talks to herdr's socket directly: an event subscription drives updates, with a slow fallback poll.
 // An extra button counts blocked/done agents in other workspaces and jumps to the first one.
 import AppKit
 
@@ -74,39 +75,146 @@ private struct Workspace: Decodable {
     let focused: Bool
 }
 
+private struct Pane: Decodable { let pane_id: String }
+
 private struct Response<T: Decodable>: Decodable { let result: T? }
-private struct WorkspaceList: Decodable { let workspaces: [Workspace] }
-private struct TabList: Decodable { let tabs: [Tab] }
+private struct SessionSnapshot: Decodable { let snapshot: Session }
+private struct Session: Decodable {
+    let workspaces: [Workspace]
+    let tabs: [Tab]
+    let panes: [Pane]
+}
 
-enum Herdr {
-    static let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/herdr").path
+/// herdr's socket API: newline-delimited JSON over `~/.config/herdr/herdr.sock` (`herdr api schema --json`).
+enum HerdrSocket {
+    static let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/herdr/herdr.sock").path
 
-    /// Runs `herdr <args>` and decodes `result`; nil if herdr is missing, not running, or slow.
-    static func run<T: Decodable>(_ args: [String], as _: T.Type) -> T? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        let out = Pipe()
-        process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { if process.isRunning { process.terminate() } }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (try? JSONDecoder().decode(Response<T>.self, from: data))?.result
+    /// A connected socket, or nil if herdr isn't running.
+    static func connect() -> Int32? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { close(fd); return nil }
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else { close(fd); return nil }
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        return fd
     }
 
+    static func send(_ fd: Int32, method: String, params: [String: Any] = [:]) -> Bool {
+        guard var data = try? JSONSerialization.data(withJSONObject: ["id": "1", "method": method, "params": params])
+        else { return false }
+        data.append(0x0A)
+        return data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } == data.count
+    }
+
+    /// One request on a fresh connection; decodes `result`, nil on error, timeout (3 s) or herdr not running.
+    static func request<T: Decodable>(_ method: String, _ params: [String: Any] = [:], as _: T.Type) -> T? {
+        guard let fd = connect() else { return nil }
+        defer { close(fd) }
+        var timeout = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        guard send(fd, method: method, params: params), let line = LineReader(fd: fd).next() else { return nil }
+        return (try? JSONDecoder().decode(Response<T>.self, from: line))?.result
+    }
+}
+
+/// Splits a socket's byte stream into lines.
+final class LineReader {
+    private let fd: Int32
+    private var buffer = Data()
+
+    init(fd: Int32) { self.fd = fd }
+
+    /// The next line without its newline; nil on EOF, error or timeout.
+    func next() -> Data? {
+        while true {
+            if let newline = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<newline]
+                buffer = Data(buffer[(newline + 1)...])
+                return Data(line)
+            }
+            var chunk = [UInt8](repeating: 0, count: 65536)
+            let count = read(fd, &chunk, chunk.count)
+            guard count > 0 else { return nil }
+            buffer.append(contentsOf: chunk[0..<count])
+        }
+    }
+}
+
+/// Keeps an `events.subscribe` connection open on a background thread and calls `onEvent` with each event
+/// name ("disconnected" when the connection drops). Reconnects every 3 s while herdr is down.
+final class EventStream {
+    /// Events that need no arguments. Status changes are subscribed per pane (`pane.agent_status_changed`
+    /// requires a pane_id); `pane.updated` may cover them too — both are logged to find out.
+    private static let kinds = [
+        "workspace.created", "workspace.closed", "workspace.renamed", "workspace.focused", "workspace.reordered",
+        "tab.created", "tab.closed", "tab.focused", "tab.renamed", "tab.moved",
+        "pane.created", "pane.closed", "pane.updated", "pane.exited", "pane.agent_detected",
+    ]
+    private static let logged: Set<String> = ["pane_updated", "pane_agent_status_changed", "disconnected"]
+
+    private let onEvent: (String) -> Void
+    private let lock = NSLock()
+    private var fd: Int32 = -1
+    private var paneIDs: [String] = []
+
+    init(onEvent: @escaping (String) -> Void) { self.onEvent = onEvent }
+
+    func start() { Thread { self.loop() }.start() }
+
+    /// Resubscribes when the set of panes changes, so every pane's status changes are delivered.
+    func watch(panes: [String]) {
+        lock.lock(); defer { lock.unlock() }
+        guard panes != paneIDs else { return }
+        paneIDs = panes
+        if fd >= 0 { shutdown(fd, SHUT_RDWR) }
+    }
+
+    private func loop() {
+        while true {
+            guard let fd = HerdrSocket.connect() else { Thread.sleep(forTimeInterval: 3); continue }
+            lock.lock(); self.fd = fd; let panes = paneIDs; lock.unlock()
+            let subscriptions: [[String: String]] = Self.kinds.map { ["type": $0] }
+                + panes.map { ["type": "pane.agent_status_changed", "pane_id": $0] }
+            if HerdrSocket.send(fd, method: "events.subscribe", params: ["subscriptions": subscriptions]) {
+                let reader = LineReader(fd: fd)
+                while let line = reader.next() {
+                    guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
+                    if let error = message["error"] { log("subscribe error: \(error)") }
+                    guard let event = message["event"] as? String else { continue }
+                    if Self.logged.contains(event) { log("event \(event)") }
+                    onEvent(event)
+                }
+            }
+            lock.lock(); close(fd); self.fd = -1; lock.unlock()
+            onEvent("disconnected")
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+    }
+}
+
+enum Herdr {
     struct Snapshot: Equatable {
         /// Tabs of the focused workspace, sorted by number.
         var tabs: [Tab] = []
         /// Blocked or done tabs in other workspaces: blocked first, then workspace order, then number.
         var elsewhere: [Tab] = []
+        var paneIDs: [String] = []
     }
 
-    /// Current herdr state, or nil if herdr is not reachable.
+    /// Current herdr state (one `session.snapshot` request), or nil if herdr is not reachable.
     static func snapshot() -> Snapshot? {
-        guard let workspaces = run(["workspace", "list"], as: WorkspaceList.self)?.workspaces,
-              let tabs = run(["tab", "list"], as: TabList.self)?.tabs else { return nil }
+        guard let session = HerdrSocket.request("session.snapshot", as: SessionSnapshot.self)?.snapshot else { return nil }
+        let workspaces = session.workspaces, tabs = session.tabs
         let focused = workspaces.first(where: \.focused)?.workspace_id
         let order = Dictionary(workspaces.enumerated().map { ($1.workspace_id, $0) }, uniquingKeysWith: { a, _ in a })
         let attention = ["blocked": 0, "done": 1]
@@ -114,7 +222,8 @@ enum Herdr {
         return Snapshot(
             tabs: tabs.filter { focused == nil || $0.workspace_id == focused }.sorted { $0.number < $1.number },
             elsewhere: tabs.filter { focused != nil && $0.workspace_id != focused && attention[$0.agent_status ?? ""] != nil }
-                .sorted { rank($0) < rank($1) }
+                .sorted { rank($0) < rank($1) },
+            paneIDs: session.panes.map(\.pane_id).sorted()
         )
     }
 
@@ -122,7 +231,7 @@ enum Herdr {
 
     /// Focuses the tab in herdr; false if herdr refused or isn't running.
     static func focus(_ tabID: String) -> Bool {
-        run(["tab", "focus", tabID], as: TabInfo.self) != nil
+        HerdrSocket.request("tab.focus", ["tab_id": tabID], as: TabInfo.self) != nil
     }
 
     static let icons = ["working": "⏳", "blocked": "🔴", "done": "✅", "idle": "⚪"]
@@ -158,6 +267,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     private var state = Herdr.Snapshot()
     private var tabs: [Tab] { state.tabs }
     private var fetching = false
+    private var refetch = false
+    private var refreshScheduled = false
+    private lazy var events = EventStream { [weak self] _ in
+        DispatchQueue.main.async { self?.scheduleRefresh() }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("launched")
@@ -176,17 +290,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
 
         present()
         refresh()
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        events.start()
+        // Events drive updates; the slow poll only covers anything they miss.
+        Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    /// Coalesces bursts of events (a tab switch sends several) into one refresh.
+    private func scheduleRefresh() {
+        guard !refreshScheduled else { return }
+        refreshScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.refreshScheduled = false
+            self.refresh()
+        }
     }
 
     private func refresh() {
-        guard !fetching else { return }
+        // An event during a fetch may postdate its snapshot: fetch again once it finishes.
+        guard !fetching else { refetch = true; return }
         fetching = true
         DispatchQueue.global(qos: .utility).async {
             let snapshot = Herdr.snapshot()
             DispatchQueue.main.async {
                 self.fetching = false
                 self.show(snapshot ?? Herdr.Snapshot())
+                if let snapshot { self.events.watch(panes: snapshot.paneIDs) }
+                if self.refetch { self.refetch = false; self.refresh() }
             }
         }
     }
