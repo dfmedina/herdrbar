@@ -1,5 +1,6 @@
 // HerdrBar — Touch Bar control panel for herdr.
 // One Touch Bar button per herdr tab (focused workspace) with live agent status; tap to jump to the tab.
+// An extra button counts blocked/done agents in other workspaces and jumps to the first one.
 import AppKit
 
 // MARK: - Logging (~/Library/Logs/HerdrBar.log; NSLog lines don't reliably reach `log show`)
@@ -95,12 +96,26 @@ enum Herdr {
         return (try? JSONDecoder().decode(Response<T>.self, from: data))?.result
     }
 
-    /// Tabs of the focused workspace sorted by number, or nil if herdr is not reachable.
-    static func tabs() -> [Tab]? {
+    struct Snapshot: Equatable {
+        /// Tabs of the focused workspace, sorted by number.
+        var tabs: [Tab] = []
+        /// Blocked or done tabs in other workspaces: blocked first, then workspace order, then number.
+        var elsewhere: [Tab] = []
+    }
+
+    /// Current herdr state, or nil if herdr is not reachable.
+    static func snapshot() -> Snapshot? {
         guard let workspaces = run(["workspace", "list"], as: WorkspaceList.self)?.workspaces,
               let tabs = run(["tab", "list"], as: TabList.self)?.tabs else { return nil }
         let focused = workspaces.first(where: \.focused)?.workspace_id
-        return tabs.filter { focused == nil || $0.workspace_id == focused }.sorted { $0.number < $1.number }
+        let order = Dictionary(workspaces.enumerated().map { ($1.workspace_id, $0) }, uniquingKeysWith: { a, _ in a })
+        let attention = ["blocked": 0, "done": 1]
+        let rank = { (tab: Tab) in (attention[tab.agent_status ?? ""] ?? 2, order[tab.workspace_id] ?? .max, tab.number) }
+        return Snapshot(
+            tabs: tabs.filter { focused == nil || $0.workspace_id == focused }.sorted { $0.number < $1.number },
+            elsewhere: tabs.filter { focused != nil && $0.workspace_id != focused && attention[$0.agent_status ?? ""] != nil }
+                .sorted { rank($0) < rank($1) }
+        )
     }
 
     private struct TabInfo: Decodable { let tab: Tab }
@@ -120,17 +135,28 @@ enum Herdr {
         guard let icon = tab.agent_status.flatMap({ icons[$0] }) else { return name }
         return "\(icon) \(name)"
     }
+
+    /// e.g. "🔴 1 ✅ 2 elsewhere"; zero counts are left out.
+    static func elsewhereTitle(for tabs: [Tab]) -> String {
+        let parts = ["blocked", "done"].compactMap { status -> String? in
+            let count = tabs.filter { $0.agent_status == status }.count
+            return count > 0 ? "\(icons[status]!) \(count)" : nil
+        }
+        return (parts + ["elsewhere"]).joined(separator: " ")
+    }
 }
 
 // MARK: - App
 
 let trayID = NSTouchBarItem.Identifier("dev.local.herdrbar.tray")
 let offID = NSTouchBarItem.Identifier("dev.local.herdrbar.off")
+let elsewhereID = NSTouchBarItem.Identifier("dev.local.herdrbar.elsewhere")
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     private let bar = NSTouchBar()
     private var trayItem: NSCustomTouchBarItem!
-    private var tabs: [Tab] = []
+    private var state = Herdr.Snapshot()
+    private var tabs: [Tab] { state.tabs }
     private var fetching = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -157,10 +183,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         guard !fetching else { return }
         fetching = true
         DispatchQueue.global(qos: .utility).async {
-            let tabs = Herdr.tabs()
+            let snapshot = Herdr.snapshot()
             DispatchQueue.main.async {
                 self.fetching = false
-                self.show(tabs ?? [])
+                self.show(snapshot ?? Herdr.Snapshot())
             }
         }
     }
@@ -169,30 +195,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         NSTouchBarItem.Identifier("dev.local.herdrbar.tab.\(tab.tab_id)")
     }
 
-    private func show(_ newTabs: [Tab]) {
-        guard newTabs != tabs else { return }
-        let sameLayout = newTabs.map(\.tab_id) == tabs.map(\.tab_id)
-        tabs = newTabs
+    private func layout(_ state: Herdr.Snapshot) -> [NSTouchBarItem.Identifier] {
+        if state.tabs.isEmpty { return [offID] }
+        return state.tabs.map(itemID) + (state.elsewhere.isEmpty ? [] : [elsewhereID])
+    }
+
+    private func show(_ newState: Herdr.Snapshot) {
+        guard newState != state else { return }
+        let sameLayout = layout(newState) == layout(state)
+        state = newState
         if !sameLayout {
-            bar.defaultItemIdentifiers = tabs.isEmpty ? [offID] : tabs.map(itemID)
+            bar.defaultItemIdentifiers = layout(state)
         }
         // NSTouchBar reuses existing items across layout changes, so look buttons up rather than caching them.
         for tab in tabs {
-            guard let button = (bar.item(forIdentifier: itemID(tab)) as? NSCustomTouchBarItem)?.view as? NSButton
-            else { continue }
+            guard let button = button(for: itemID(tab)) else { continue }
             style(button, for: tab)
         }
+        if let button = button(for: elsewhereID) { styleElsewhere(button) }
+    }
+
+    private func button(for id: NSTouchBarItem.Identifier) -> NSButton? {
+        (bar.item(forIdentifier: id) as? NSCustomTouchBarItem)?.view as? NSButton
     }
 
     private func style(_ button: NSButton, for tab: Tab) {
         button.title = Herdr.title(for: tab)
-        button.bezelColor = tab.focused ? .controlAccentColor : nil
+        // Blocked wins over focused: the focused tab is the one on screen anyway.
+        button.bezelColor = tab.agent_status == "blocked" ? .systemRed : tab.focused ? .controlAccentColor : nil
+    }
+
+    private func styleElsewhere(_ button: NSButton) {
+        button.title = Herdr.elsewhereTitle(for: state.elsewhere)
+        button.bezelColor = state.elsewhere.contains { $0.agent_status == "blocked" } ? .systemRed : nil
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier id: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         let item = NSCustomTouchBarItem(identifier: id)
         if id == offID {
             item.view = NSButton(title: "herdr off", target: self, action: #selector(bringGhosttyForward))
+        } else if id == elsewhereID {
+            let button = NSButton(title: "", target: self, action: #selector(tappedElsewhere))
+            styleElsewhere(button)
+            item.view = button
         } else if let tab = tabs.first(where: { itemID($0) == id }) {
             let button = NSButton(title: "", target: self, action: #selector(tapped(_:)))
             button.identifier = NSUserInterfaceItemIdentifier(tab.tab_id)
@@ -206,6 +251,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
 
     @objc private func tapped(_ sender: NSButton) {
         guard let tabID = sender.identifier?.rawValue else { return }
+        focus(tabID)
+    }
+
+    /// Jumps to the first blocked (else done) tab in another workspace; herdr switches workspace itself.
+    @objc private func tappedElsewhere() {
+        guard let tab = state.elsewhere.first else { return }
+        focus(tab.tab_id)
+    }
+
+    private func focus(_ tabID: String) {
         DispatchQueue.global(qos: .userInitiated).async {
             let ok = Herdr.focus(tabID)
             if !ok { log("focus \(tabID) failed") }

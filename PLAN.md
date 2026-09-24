@@ -98,8 +98,46 @@ workspace sorted by `number`; icons ⏳ working · 🔴 blocked · ✅ done · �
    **Done 2026-09-23.** `./login.sh on|off`; KeepAlive restarts on crash (tested with `kill -9`).
    `build.sh` boots the agent out before replacing the app and bootstraps it after.
 
-Later (not v1): instant updates via herdr `events.subscribe` (`pane.agent_status_changed`);
-long-press actions (jump to blocked agent, new tab).
+## Status (2026-09-23)
+
+v1 (phases 1–5) is done, running at login, and pushed to github.com/dfmedina/herdrbar (public).
+Repo-local git author is dfmedina (`5438664+dfmedina@users.noreply.github.com`); remote uses the SSH
+host alias `github-dfmedina` (`~/.ssh/config` → `~/.ssh/id_ed25519`). `gh` is logged in as diefmedina.
+Workflow: edit `Sources/main.swift` → `./build.sh` (restarts the running app) → user tests on the Touch Bar.
+Don't quit herdr to test anything: the Claude session runs inside it.
+
+## Next (v2) — build phase by phase, test each with the user
+
+Suggested order: 6 + 8 together, then 7, then 9, then 10.
+
+6. **Waiting agents in other workspaces** — today only the focused workspace is shown, so a 🔴 blocked
+   agent elsewhere is invisible. Add one extra button, e.g. `🔴 2 elsewhere` (count blocked tabs outside
+   the focused workspace; maybe ✅ done too — ask). Hidden when the count is 0. Tap → `herdr tab focus`
+   the first such tab (herdr switches workspace) + bring Ghostty forward. `herdr tab list` already
+   returns tabs of all workspaces, so no extra command is needed.
+   **Done 2026-09-23.** Counts blocked + done tabs elsewhere (`🔴 1 ✅ 2 elsewhere`, zero counts omitted);
+   red bezel if any is blocked. Tap jumps to the first blocked tab, else the first done one (then workspace
+   order, then tab number). `Herdr.snapshot()` returns focused-workspace tabs + this list; still 2 calls/s.
+7. **Instant updates via events** — replace the 1 s poll (2 `herdr` processes/s) with a long-running
+   subscription: herdr `events.subscribe`, event `pane.agent_status_changed` (check `herdr --help` / docs
+   for the exact CLI or socket protocol at `~/.config/herdr/herdr.sock`). On any event, re-fetch tabs.
+   Keep a slow fallback poll (e.g. 10 s) for tab add/remove/rename/focus if those have no events, and
+   to recover if herdr restarts.
+8. **Make "blocked" stand out** — red `bezelColor` on blocked tabs (e.g. `.systemRed`); the accent color
+   stays for the focused tab. Decide with the user what a focused *and* blocked tab looks like.
+   **Done 2026-09-23.** Blocked tabs get `.systemRed`; red wins on a focused + blocked tab.
+9. **Many tabs** — ~7+ tabs overflow the bar even with the 16-char cap. Switch the tab buttons to a
+   horizontally scrolling row (`NSScrubber`, or an `NSScrollView` of buttons inside one custom item) when
+   they don't fit. Keep per-tab lookup by `tab_id` (see phase 2 note on item reuse).
+10. **Long-press actions** — e.g. long-press a tab button → menu/popover: jump to the first blocked agent,
+   new tab (`herdr tab --help` for the create command). Use `NSPressGestureRecognizer` on the button.
+
+## Housekeeping
+
+- **Test "herdr off"** at a moment herdr isn't running (outside a herdr-hosted session): bar shows
+  "herdr off", tap opens Ghostty, tab buttons return by themselves once herdr is back.
+- **Test start at login** on the next real login/restart (buttons should appear on their own).
+- Ghostty is hard-coded (`com.mitchellh.ghostty`) — fine unless the user changes terminal.
 
 ## Risks
 
