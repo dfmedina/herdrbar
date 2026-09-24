@@ -71,6 +71,7 @@ workspace sorted by `number`; icons ⏳ working · 🔴 blocked · ✅ done · �
 ├── Sources/main.swift   # the whole app (~150–200 lines)
 ├── Info.plist           # LSUIElement, bundle id e.g. dev.local.herdrbar
 ├── build.sh             # swiftc -> HerdrBar.app, ad-hoc sign (codesign -s -), copy to ~/Applications
+├── login.sh             # on|off: LaunchAgent to start at login
 └── README.md            # build / run / remove
 ```
 
@@ -94,6 +95,8 @@ workspace sorted by `number`; icons ⏳ working · 🔴 blocked · ✅ done · �
    **Done 2026-09-23.** Focused tab: `bezelColor = .controlAccentColor`. Names capped at 16 chars with "…".
    "herdr off" is a button that opens Ghostty — not yet tested (quitting herdr would kill the Claude session running in it).
 5. **Start at login (optional, ask first)** — LaunchAgent in `~/Library/LaunchAgents`; README explains removal.
+   **Done 2026-09-23.** `./login.sh on|off`; KeepAlive restarts on crash (tested with `kill -9`).
+   `build.sh` boots the agent out before replacing the app and bootstraps it after.
 
 Later (not v1): instant updates via herdr `events.subscribe` (`pane.agent_status_changed`);
 long-press actions (jump to blocked agent, new tab).
@@ -107,4 +110,4 @@ long-press actions (jump to blocked agent, new tab).
 
 ## Removal
 
-Delete `~/Applications/HerdrBar.app`, this folder, and the LaunchAgent plist if added.
+`./login.sh off`, then delete `~/Applications/HerdrBar.app`, `~/Library/Logs/HerdrBar.log` and this folder.
