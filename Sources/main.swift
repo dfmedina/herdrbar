@@ -153,14 +153,13 @@ final class LineReader {
 /// Keeps an `events.subscribe` connection open on a background thread and calls `onEvent` with each event
 /// name ("disconnected" when the connection drops). Reconnects every 3 s while herdr is down.
 final class EventStream {
-    /// Events that need no arguments. Status changes are subscribed per pane (`pane.agent_status_changed`
-    /// requires a pane_id); `pane.updated` may cover them too — both are logged to find out.
+    /// Events that need no arguments. Status changes are subscribed per pane: `pane.agent_status_changed`
+    /// requires a pane_id, and `pane.updated` does not fire on status changes (verified with herdr 0.9.1).
     private static let kinds = [
         "workspace.created", "workspace.closed", "workspace.renamed", "workspace.focused", "workspace.reordered",
         "tab.created", "tab.closed", "tab.focused", "tab.renamed", "tab.moved",
-        "pane.created", "pane.closed", "pane.updated", "pane.exited", "pane.agent_detected",
+        "pane.created", "pane.closed", "pane.exited", "pane.agent_detected",
     ]
-    private static let logged: Set<String> = ["pane_updated", "pane_agent_status_changed", "disconnected"]
 
     private let onEvent: (String) -> Void
     private let lock = NSLock()
@@ -191,7 +190,6 @@ final class EventStream {
                     guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
                     if let error = message["error"] { log("subscribe error: \(error)") }
                     guard let event = message["event"] as? String else { continue }
-                    if Self.logged.contains(event) { log("event \(event)") }
                     onEvent(event)
                 }
             }

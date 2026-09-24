@@ -150,10 +150,12 @@ Suggested order: 6 + 8 together, then 7, then 9, then 10.
      blocked — bar should update with no visible lag; `ps` shows no `herdr` child processes; CPU ~0.
    - Risk: the socket API is versioned (`protocol: 22`); a herdr update could change it. On decode
      failures, log once and fall back to the 1 s CLI poll? — keep it simple unless it happens.
-   **Built 2026-09-24, not yet verified.** Socket client + `EventStream` as planned (subscribes to both
-   `pane.updated` and per-pane `pane.agent_status_changed`, logs them). Tab focus events confirmed working
-   (probe). Open issue: after launch, a working→done change on the CC pane logged **no** status event, so
-   status may only update via the 10 s fallback — investigate before marking done.
+   **Built 2026-09-24.** Socket client + `EventStream` as planned; no `herdr` processes, ~0% CPU.
+   Findings: status changes arrive only via per-pane `pane.agent_status_changed` (`pane.updated` does not
+   fire for them). Status events are named with dots (`pane.agent_status_changed`) while the others use
+   underscores (`tab_focused`, `workspace_focused`) — match on names carefully. Status comes from herdr's
+   own pane detection (the Claude/opencode hooks only report session start); a pane you're looking at goes
+   working→idle, not done.
 8. **Make "blocked" stand out** — red `bezelColor` on blocked tabs (e.g. `.systemRed`); the accent color
    stays for the focused tab. Decide with the user what a focused *and* blocked tab looks like.
    **Done 2026-09-23.** Blocked tabs get `.systemRed`; red wins on a focused + blocked tab.
